@@ -1,5 +1,5 @@
 ### IMPORTS
-from sewar.full_ref import *
+from sewar.full_ref import filter2, fspecial, Filter, uniform_filter
 import numpy as np
 import matplotlib.image
 import matplotlib.pyplot as plt
@@ -11,13 +11,237 @@ from skimage.util import view_as_windows
 from scipy.signal import convolve2d
 from scipy.ndimage import gaussian_filter
 import ismrmrd
+import warnings
 from scipy import ndimage
 from scipy.fft import fftn, ifftn, fftshift, ifftshift
+from typing import *
+from numpy.typing import ArrayLike
+from matplotlib.axes import Axes
+
+
 
 
 ### SECTION 1
 
-def echo_train_length(dset) -> int:
+def _initial_check(GT,P):
+    assert GT.shape == P.shape, "Supplied images have different sizes " + \
+    str(GT.shape) + " and " + str(P.shape)
+    if GT.dtype != P.dtype:
+        msg = "Supplied images have different dtypes " + \
+            str(GT.dtype) + " and " + str(P.dtype)
+        warnings.warn(msg)
+
+    if len(GT.shape) == 2:
+        GT = GT[:,:,np.newaxis]
+        P = P[:,:,np.newaxis]
+
+    return GT.astype(np.float64),P.astype(np.float64)
+
+
+def _get_sums(GT,P,win,mode='same'):
+    mu1,mu2 = (filter2(GT,win,mode),filter2(P,win,mode))
+    return mu1*mu1, mu2*mu2, mu1*mu2
+
+
+def _get_sigmas(GT,P,win,mode='same',**kwargs):
+    if 'sums' in kwargs:
+        GT_sum_sq,P_sum_sq,GT_P_sum_mul = kwargs['sums']
+    else:
+        GT_sum_sq,P_sum_sq,GT_P_sum_mul = _get_sums(GT,P,win,mode)
+
+    return filter2(GT*GT,win,mode)  - GT_sum_sq,\
+            filter2(P*P,win,mode)  - P_sum_sq, \
+            filter2(GT*P,win,mode) - GT_P_sum_mul
+
+
+def _ssim_single (GT,P,ws,C1,C2,fltr_specs,mode):
+    win = fspecial(**fltr_specs)
+
+    GT_sum_sq,P_sum_sq,GT_P_sum_mul = _get_sums(GT,P,win,mode)
+    sigmaGT_sq,sigmaP_sq,sigmaGT_P = _get_sigmas(GT,P,win,mode,sums=(GT_sum_sq,P_sum_sq,GT_P_sum_mul))
+
+    assert C1 > 0
+    assert C2 > 0
+
+    ssim_map = ((2*GT_P_sum_mul + C1)*(2*sigmaGT_P + C2))/((GT_sum_sq + P_sum_sq + C1)*(sigmaGT_sq + sigmaP_sq + C2))
+    cs_map = (2*sigmaGT_P + C2)/(sigmaGT_sq + sigmaP_sq + C2)
+    return np.mean(ssim_map), np.mean(cs_map)
+
+
+def ssim(gt: np.ndarray, p: np.ndarray, ws: int = 11, k1: float = 0.01, k2: float = 0.03,
+         max_val: Optional[int] = None, fltr_specs: Optional[Dict[str, int]] = None,
+         mode: str = 'valid') -> Tuple[float, float]:
+    """
+    Calculates structural similarity index (ssim).
+
+    Parameters:
+    - gt (np.ndarray): The first (original) input image.
+    - p (np.ndarray): The second (deformed) input image.
+    - ws (int): Sliding window size (default = 11).
+    - k1 (float): First constant for SSIM (default = 0.01).
+    - k2 (float): Second constant for SSIM (default = 0.03).
+    - max_val (Optional[int]): Maximum value of datarange (if None, max_val is calculated using image dtype).
+    - fltr_specs (Optional[Dict[str, int]]): Filter specifications (default = None).
+    - mode (str): Convolution mode for valid (default = 'valid').
+
+    Returns:
+    - Tuple[float, float]: ssim value, cs value.
+    """
+    if max_val is None:
+        max_val = np.iinfo(gt.dtype).max
+
+    gt, p = _initial_check(gt, p)
+
+    if fltr_specs is None:
+        fltr_specs = dict(fltr=Filter.UNIFORM, ws=ws)
+
+    c1 = (k1 * max_val)**2
+    c2 = (k2 * max_val)**2
+
+    ssims = []
+    css = []
+    for i in range(gt.shape[2]):
+        ssim_val, cs = _ssim_single(gt[:, :, i], p[:, :, i], ws, c1, c2, fltr_specs, mode)
+        ssims.append(ssim_val)
+        css.append(cs)
+    return np.mean(ssims), np.mean(css)
+
+
+def mse(gt: np.ndarray, p: np.ndarray) -> float:
+    """
+    Calculates mean squared error (mse) between two images.
+
+    Parameters:
+    - gt (np.ndarray): The first (original) input image.
+    - p (np.ndarray): The second (deformed) input image.
+
+    Returns:
+    - float: mse value.
+    """
+    return np.mean((gt.astype(np.float64) - p.astype(np.float64))**2)
+
+
+def rmse(gt: np.ndarray, p: np.ndarray) -> float:
+    """
+    Calculates root mean squared error (rmse).
+
+    Parameters:
+    - gt (np.ndarray): The first (original) input image.
+    - p (np.ndarray): The second (deformed) input image.
+
+    Returns:
+    - float: rmse value.
+    """
+    gt, p = _initial_check(gt, p)
+    return np.sqrt(mse(gt, p))
+
+
+def _vifp_single(GT,P,sigma_nsq):
+    EPS = 1e-10
+    num =0.0
+    den =0.0
+    for scale in range(1,5):
+        N=2.0**(4-scale+1)+1
+        win = fspecial(Filter.GAUSSIAN,ws=N,sigma=N/5)
+
+        if scale >1:
+            GT = filter2(GT,win,'valid')[::2, ::2]
+            P = filter2(P,win,'valid')[::2, ::2]
+
+        GT_sum_sq,P_sum_sq,GT_P_sum_mul = _get_sums(GT,P,win,mode='valid')
+        sigmaGT_sq,sigmaP_sq,sigmaGT_P = _get_sigmas(GT,P,win,mode='valid',sums=(GT_sum_sq,P_sum_sq,GT_P_sum_mul))
+
+
+        sigmaGT_sq[sigmaGT_sq<0]=0
+        sigmaP_sq[sigmaP_sq<0]=0
+
+        g=sigmaGT_P /(sigmaGT_sq+EPS)
+        sv_sq=sigmaP_sq-g*sigmaGT_P
+
+        g[sigmaGT_sq<EPS]=0
+        sv_sq[sigmaGT_sq<EPS]=sigmaP_sq[sigmaGT_sq<EPS]
+        sigmaGT_sq[sigmaGT_sq<EPS]=0
+
+        g[sigmaP_sq<EPS]=0
+        sv_sq[sigmaP_sq<EPS]=0
+
+        sv_sq[g<0]=sigmaP_sq[g<0]
+        g[g<0]=0
+        sv_sq[sv_sq<=EPS]=EPS
+
+
+        num += np.sum(np.log10(1.0+(g**2.)*sigmaGT_sq/(sv_sq+sigma_nsq)))
+        den += np.sum(np.log10(1.0+sigmaGT_sq/sigma_nsq))
+
+    return num/den
+
+
+def vifp(gt: np.ndarray, p: np.ndarray, sigma_nsq: float = 2) -> float:
+    """
+    Calculates Pixel Based Visual Information Fidelity (vif-p).
+
+    Parameters:
+    - gt (np.ndarray): The first (original) input image.
+    - p (np.ndarray): The second (deformed) input image.
+    - sigma_nsq (float): Variance of the visual noise (default = 2).
+
+    Returns:
+    - float: vif-p value.
+    """
+    gt, p = _initial_check(gt, p)
+    return np.mean([_vifp_single(gt[:, :, i], p[:, :, i], sigma_nsq) for i in range(gt.shape[2])])
+
+
+def _power_complex(a,b):
+        return a.astype('complex') ** b
+
+
+def msssim(gt: np.ndarray, p: np.ndarray, weights: Union[List[float], np.ndarray] = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333],
+           ws: int = 11, k1: float = 0.01, k2: float = 0.03, max_val: Optional[int] = None) -> float:
+    """
+    Calculates multi-scale structural similarity index (ms-ssim).
+
+    Parameters:
+    - gt (np.ndarray): The first (original) input image.
+    - p (np.ndarray): The second (deformed) input image.
+    - weights (Union[List[float], np.ndarray]): Weights for each scale (default = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]).
+    - ws (int): Sliding window size (default = 11).
+    - k1 (float): First constant for SSIM (default = 0.01).
+    - k2 (float): Second constant for SSIM (default = 0.03).
+    - max_val (Optional[int]): Maximum value of datarange (if None, max_val is calculated using image dtype).
+
+    Returns:
+    - float: ms-ssim value.
+    """
+    if max_val is None:
+        max_val = np.iinfo(gt.dtype).max
+
+    gt, p = _initial_check(gt, p)
+
+    scales = len(weights)
+
+    fltr_specs = dict(fltr=Filter.GAUSSIAN, sigma=1.5, ws=11)
+
+    if isinstance(weights, list):
+        weights = np.array(weights)
+
+    mssim_vals = []
+    mcs_vals = []
+    for _ in range(scales):
+        _ssim, _cs = ssim(gt, p, ws=ws, k1=k1, k2=k2, max_val=max_val, fltr_specs=fltr_specs)
+        mssim_vals.append(_ssim)
+        mcs_vals.append(_cs)
+
+        filtered = [uniform_filter(im, 2) for im in [gt, p]]
+        gt, p = [x[::2, ::2, :] for x in filtered]
+
+    mssim_vals = np.array(mssim_vals, dtype=np.float64)
+    mcs_vals = np.array(mcs_vals, dtype=np.float64)
+
+    return np.prod(_power_complex(mcs_vals[:scales - 1], weights[:scales - 1])) * _power_complex(mssim_vals[scales - 1], weights[scales - 1])
+
+
+def echo_train_length(dset: ismrmrd.Dataset) -> Optional[int]:
     """
     Calculate the echo train length (ETL) from an ISMRMRD dataset.
 
@@ -52,7 +276,7 @@ def echo_train_length(dset) -> int:
     return None
 
 
-def echo_train_count(dset):
+def echo_train_count(dset: ismrmrd.Dataset) -> Optional[int]:
     """
     Calculate the echo train count (ETC) from an ISMRMRD dataset.
 
@@ -89,15 +313,16 @@ def echo_train_count(dset):
     etc = int(count / (nslices * echo_train_length(dset)))
     return etc
 
-def normalize8(image):
+
+def normalize8(image: ArrayLike) -> np.ndarray:
     """
     Normalize an input image array to the range [0, 255] and convert to 8-bit unsigned integers.
 
     Parameters:
-    image (numpy.ndarray): Input image array containing numeric pixel values to be normalized.
+    - image (ArrayLike): Input image array containing numeric pixel values to be normalized.
 
     Returns:
-    numpy.ndarray: Normalized image array with pixel values in the range [0, 255] as 8-bit unsigned integers.
+    - numpy.ndarray: Normalized image array with pixel values in the range [0, 255] as 8-bit unsigned integers.
     """
 
     # Find the minimum pixel value in the input image array
@@ -123,53 +348,51 @@ def normalize8(image):
     return normalized_image_uint8
 
 
-def iqm(im1, im2, string=True):
+def iqm(im1: np.ndarray, im2: np.ndarray, string: bool = True) -> Union[str, tuple]:
     """
     Calculate and return various image quality metrics between two input images.
 
     Parameters:
-    im1 (numpy.ndarray): The first input image for comparison.
-    im2 (numpy.ndarray): The second input image for comparison.
-    string (bool): If True, return the metrics as a formatted string.
-                   If False, return the metrics as a tuple of numeric values.
+    - im1 (np.ndarray): The first input image for comparison.
+    - im2 (np.ndarray): The second input image for comparison.
+    - string (bool): If True, return the metrics as a formatted string.
+                     If False, return the metrics as a tuple of numeric values.
 
     Returns:
-    str or tuple: If string=True, a formatted string containing SSIM, RMSE, VIFP, MS-SSIM, and PSNR metrics.
-                  If string=False, a tuple containing SSIM, RMSE, VIFP, MS-SSIM, and PSNR values.
+    - str or tuple: If string=True, a formatted string containing SSIM, VIFP, and MS-SSIM metrics.
+                    If string=False, a tuple containing SSIM, VIFP, and MS-SSIM values.
     """
     # Calculate SSIM, RMSE, VIFP, MS-SSIM, and PSNR metrics
-    ssim_score = ssim(im1, im2)[0]
-    rmse_score = np.sqrt(mse(im1, im2))
+    ssim_score = ssim(im1, im2)
     vifp_score = vifp(im1, im2)
-    msssim_score = np.real(msssim(im1, im2))
-    psnr_score = psnr(im1, im2)
+    msssim_score = msssim(im1, im2)
 
     if string:
         # Return metrics as a formatted string
-        metrics_string = f'SSIM: {ssim_score}\nRMSE: {rmse_score}\nVIFP: {vifp_score}\nMS-SSIM: {msssim_score}\nPSNR: {psnr_score}'
+        metrics_string = f'SSIM: {ssim_score}\nVIFP: {vifp_score}\nMS-SSIM: {msssim_score}'
         return metrics_string
     else:
         # Return metrics as a tuple of numeric values
-        return ssim_score, rmse_score, vifp_score, msssim_score, psnr_score
+        return ssim_score, vifp_score, msssim_score
 
 
-def homogeneous_mask(data, R):
+def homogeneous_mask(data: ArrayLike, r: int) -> np.ndarray:
     """
     Create a homogeneous mask for a given 4D data array by setting values at regular intervals to zero.
 
     Parameters:
-    data (numpy.ndarray): Input 4D data array.
-    R (int): Interval for setting values to zero. For example, if R=2, every second value will be set to zero.
+    - data (ArrayLike): Input 4D data array.
+    - R (int): Interval for setting values to zero. For example, if R=2, every second value will be set to zero.
 
     Returns:
-    numpy.ndarray: 4D data array with values set to zero at regular intervals defined by R.
+    - masked_data (numpy.ndarray): 4D data array with values set to zero at regular intervals defined by R.
     """
     masked_data = data.copy()
     # Create a mask with the same shape as the input data, initialized with zeros
     mask = np.zeros_like(data)
 
     # Set values to 1 in the mask at regular intervals along the specified dimension
-    mask[:, :, :, ::R, :] = 1
+    mask[:, :, :, ::r, :] = 1
 
     # Set values in the input data to zero where the mask is zero
     masked_data[mask == 0] = 0
@@ -177,31 +400,49 @@ def homogeneous_mask(data, R):
     return masked_data
 
 
-def zero_padding_zy(data,a=2.0):
-    sh_z, sh_y = [np.shape(data)[2],np.shape(data)[3]]
-    im_z, im_y = int(a * sh_z), int(a * sh_y)
+def zero_pad_zy(data: ArrayLike, scaling_factor: float = 2.0) -> np.ndarray:
+    """
+    Zero-pads the input data along the Z and Y dimensions.
+
+    Parameters:
+    - data (ArrayLike): The input data to be zero-padded. It's assumed to have at least 4 dimensions.
+    - scaling_factor (float, optional): The scaling factor for the zero-padding. Default is 2.0.
+
+    Returns:
+    - padded_data (numpy.ndarray): The zero-padded data with modified dimensions according to the scaling factor.
+    """
+
+    # Get the original shape of the data along Z and Y dimensions
+    sh_z, sh_y = [np.shape(data)[2], np.shape(data)[3]]
+
+    # Calculate the new dimensions after applying the scaling factor
+    im_z, im_y = int(scaling_factor * sh_z), int(scaling_factor * sh_y)
+
+    # Calculate the starting index for zero-padding along Z and Y dimensions
     z_0 = im_z // 2 - (sh_z // 2)
     y_0 = im_y // 2 - (sh_y // 2)
 
-    y3_shape = list(data.shape)
-    y3_shape[2] = int(a * y3_shape[2])
-    y3_shape[3] = int(a * y3_shape[3])
-    y3 = np.zeros(y3_shape, dtype=np.complex64)
+    # Create a new array with modified dimensions for zero-padded data
+    padded_shape = list(data.shape)
+    padded_shape[2] = int(scaling_factor * padded_shape[2])
+    padded_shape[3] = int(scaling_factor * padded_shape[3])
+    padded_data = np.zeros(padded_shape, dtype=np.complex64)
 
-    y3[:, :, z_0:z_0 + sh_z, y_0:y_0 + sh_y, :] = data
+    # Copy the original data into the zero-padded array at the appropriate indices
+    padded_data[:, :, z_0:z_0 + sh_z, y_0:y_0 + sh_y, :] = data
 
-    return y3
+    return padded_data
 
 
-def image_order(data):
+def image_order(data: np.ndarray) -> np.ndarray:
     """
     Rearrange the data array to a specific order by interleaving two halves of the data along a dimension.
 
     Parameters:
-    data (numpy.ndarray): Input data array to be rearranged.
+    - data (numpy.ndarray): Input data array to be rearranged.
 
     Returns:
-    numpy.ndarray: Rearranged data array with two halves interleaved along a dimension.
+    - ordered_data (numpy.ndarray): Rearranged data array with two halves interleaved along a dimension.
     """
     # Create a new complex array with the same shape as the input data, initialized with zeros
     ordered_data = np.zeros_like(data, dtype=np.complex64)
@@ -216,7 +457,7 @@ def image_order(data):
     return ordered_data
 
 
-def set_size(w, h, ax=None):
+def set_size(w: float, h: float, ax: Axes = None) -> None:
     """
     Set the size of a matplotlib figure.
 
@@ -248,17 +489,26 @@ def set_size(w, h, ax=None):
     ax.figure.set_size_inches(figw, figh)
 
 
-def imshow(image_matrix, tile_shape=None, scale=None, titles=[], fontsize = 100, colorbar=False, cmap='jet', size = [10,10], text = '', image_name = ''):
+def imshow(image_matrix: np.ndarray, tile_shape: tuple = None, scale: tuple = None,
+           titles: list = [], fontsize: int = 100, colorbar: bool = False, cmap: str = 'jet',
+           size: list = [10, 10], text: str = '', image_name: str = '') -> None:
+    """
+    Tiles images and displays them in a window.
 
-    #Added some changes on matplotlib.pyplot.imshow, ref: https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.imshow.html
+    Parameters:
+    - image_matrix (np.ndarray): A 2D or 3D set of image data.
+    - tile_shape (tuple, optional): Shape ``(rows, cols)`` for tiling images.
+    - scale (tuple, optional): ``(min,max)`` values for scaling all images.
+    - titles (list, optional): List of titles for each subplot.
+    - fontsize (int): Font size for titles and text.
+    - colorbar (bool): Whether to display colorbars for each image.
+    - cmap (str): Colormap for all images.
+    - size (list): Size of the figure in inches.
+    - text (str): Additional text to be displayed in the figure.
+    - image_name (str): Name of the saved image file (if provided).
 
-    """ Tiles images and displays them in a window.
-
-    :param image_matrix: a 2D or 3D set of image data
-    :param tile_shape: optional shape ``(rows, cols)`` for tiling images
-    :param scale: optional ``(min,max)`` values for scaling all images
-    :param titles: optional list of titles for each subplot
-    :param cmap: optional colormap for all images
+    Notes:
+    - Added some changes on matplotlib.pyplot.imshow, ref: https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.imshow.html
     """
 
     assert image_matrix.ndim in [2, 3], "image_matrix must have 2 or 3 dimensions"
@@ -322,19 +572,20 @@ def imshow(image_matrix, tile_shape=None, scale=None, titles=[], fontsize = 100,
         plt.savefig(image_name + '.png')
 
 
-def crop_array(arr, x, y, offx=0, offy=0):
+def crop_array(arr: np.ndarray, x: int, y: int, offx: int = 0, offy: int = 0) -> np.ndarray:
+
     """
     Crop the last two dimensions of a multidimensional array to the size of x,y.
 
-    Args:
-    - arr: numpy array of shape (..., H, W), where H and W are the height and width of the last two dimensions.
-    - x: integer representing the desired height of the cropped array.
-    - y: integer representing the desired width of the cropped array.
-    - offx: optional integer representing the vertical offset (default is 0).
-    - offy: optional integer representing the horizontal offset (default is 0).
+    Parameters:
+    - arr (np.ndarray): Numpy array of shape (..., H, W), where H and W are the height and width of the last two dimensions.
+    - x (int): Integer representing the desired height of the cropped array.
+    - y (int): Integer representing the desired width of the cropped array.
+    - offx (int, optional): Integer representing the vertical offset (default is 0).
+    - offy (int, optional): Integer representing the horizontal offset (default is 0).
 
     Returns:
-    - cropped_arr: numpy array of shape (..., x, y), representing the cropped version of the input array.
+    - cropped_arr (np.ndarray): Numpy array of shape (..., x, y), representing the cropped version of the input array.
     """
     # Calculate pixel offsets based on the provided offsets and scaling factor
     # This is used to crop dataset 1, offset information is in each slice of dataset 2 in millimeters, so we need to
@@ -357,18 +608,18 @@ def crop_array(arr, x, y, offx=0, offy=0):
     return cropped_arr
 
 
-def pad_image_stack(images):
+def pad_image_stack(images: Union[list, np.ndarray]) -> np.ndarray:
     """
     Pad a stack of 2D images to a common size of 512x512.
 
-    Args:
-    - images: List or array of 2D image arrays.
+    Parameters:
+    - images Union[list, np.ndarray]: List or array of 2D image arrays.
 
     Returns:
-    - padded_images: Array of padded 2D image arrays with a common size of 512x512.
+    - padded_images (np.ndarray): Array of padded 2D image arrays with a common size of 512x512.
     """
     # Initialize an array to store padded images
-    padded_images = np.zeros((len(images), 512, 512), dtype=complex)
+    padded_images = np.zeros((len(images), 512, 512), dtype=np.complex64)
 
     # Iterate over each image and pad it to 512x512
     for i, image in enumerate(images):
@@ -389,40 +640,26 @@ def pad_image_stack(images):
     return padded_images
 
 
-def grappa(kspace, calib, kernel_size=(5, 5), coil_axis=-1, lamda=0.01, memmap=False, memmap_filename='out.memmap', silent=True):
+def grappa(kspace: np.ndarray, calib: np.ndarray, kernel_size: Tuple[int, int] = (5, 5), coil_axis: int = -1,
+           lamda: float = 0.01, memmap: bool = False, memmap_filename: str = 'out.memmap', silent: bool = True
+           ) -> Union[np.ndarray, None]:
+    """
+    GeneRalized Autocalibrating Partially Parallel Acquisitions.
 
-    # SOURCE: https://github.com/mckib2/pygrappa/blob/688e845e81fd37dd0632e135c7ab66caa6b2b7d6/pygrappa/grappa.py#L32
+    Parameters:
+    - kspace (np.ndarray): 2D multi-coil k-space data to reconstruct from. Ensure that the missing entries have exact zeros.
+    - calib (np.ndarray): Calibration data (fully sampled k-space).
+    - kernel_size (Tuple[int, int], optional): Size of the 2D GRAPPA kernel (kx, ky).
+    - coil_axis (int, optional): Dimension holding coil data. The other two dimensions should be image size: (sx, sy).
+    - lamda (float, optional): Tikhonov regularization for the kernel calibration.
+    - memmap (bool, optional): Store data in Numpy memmaps. Use when datasets are too large to store in memory.
+    - memmap_filename (str, optional): Name of memmap to store results in. File is only saved if memmap=True.
+    - silent (bool, optional): Suppress messages to the user.
 
-    '''GeneRalized Autocalibrating Partially Parallel Acquisitions.
+    Returns:
+    - res (np.ndarray or None): k-space data where missing entries have been filled in.
 
-    Parameters
-    ----------
-    kspace : array_like
-        2D multi-coil k-space data to reconstruct from.  Make sure
-        that the missing entries have exact zeros in them.
-    calib : array_like
-        Calibration data (fully sampled k-space).
-    kernel_size : tuple, optional
-        Size of the 2D GRAPPA kernel (kx, ky).
-    coil_axis : int, optional
-        Dimension holding coil data.  The other two dimensions should
-        be image size: (sx, sy).
-    lamda : float, optional
-        Tikhonov regularization for the kernel calibration.
-    memmap : bool, optional
-        Store data in Numpy memmaps.  Use when datasets are too large
-        to store in memory.
-    memmap_filename : str, optional
-        Name of memmap to store results in.  File is only saved if
-        memmap=True.
-    silent : bool, optional
-        Suppress messages to user.
-
-    Returns
-    -------
-    res : array_like
-        k-space data where missing entries have been filled in.
-
+    -----
     Notes
     -----
     Based on implementation of the GRAPPA algorithm [1]_ for 2D
@@ -438,7 +675,7 @@ def grappa(kspace, calib, kernel_size=(5, 5), coil_axis=-1, lamda=0.01, memmap=F
            Resonance in Medicine: An Official Journal of the
            International Society for Magnetic Resonance in Medicine
            47.6 (2002): 1202-1210.
-    '''
+    """
 
     # Remember what shape the final reconstruction should be
     fin_shape = kspace.shape[:]
@@ -613,17 +850,18 @@ def grappa(kspace, calib, kernel_size=(5, 5), coil_axis=-1, lamda=0.01, memmap=F
         return np.moveaxis((recon[:] + kspace)[kx2:-kx2, ky2:-ky2, :], -1, coil_axis)
 
 
-def transform_kspace_to_image(k, dim=None, img_shape=None):
+def transform_kspace_to_image(k: np.ndarray, dim: Optional[Union[int, List[int]]] = None,
+                              img_shape: Optional[Union[int, Tuple[int, ...]]] = None) -> np.ndarray:
     """
     Computes the Fourier transform from k-space to image space along given or all dimensions.
 
     Args:
-    - k: k-space data (complex-valued)
-    - dim: Vector of dimensions to transform (optional, default is all dimensions).
-    - img_shape: Desired shape of the output image (optional).
+    - k (np.ndarray): k-space data (complex-valued).
+    - dim (Optional[Union[int, List[int]]]): Vector of dimensions to transform (default is all dimensions).
+    - img_shape (Optional[Union[int, Tuple[int, ...]]]): Desired shape of the output image.
 
     Returns:
-    - img: Data in image space along transformed dimensions.
+    - img (np.ndarray): Data in image space along transformed dimensions.
     """
     if not dim:
         dim = range(k.ndim)
@@ -639,25 +877,25 @@ def transform_kspace_to_image(k, dim=None, img_shape=None):
     return img
 
 
-def ismrm_eig_power(R):
+def ismrm_eig_power(r: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute dominant eigenvectors using the power method.
 
     Args:
-    - R: 4D array representing sample correlation matrices (rows x cols x ncoils x ncoils).
+    - r (np.ndarray): 4D array representing sample correlation matrices (rows x cols x ncoils x ncoils).
 
     Returns:
-    - v: Dominant eigenvectors corresponding to the sample correlation matrices.
-    - d: Dominant eigenvalues corresponding to the sample correlation matrices.
+    - v (np.ndarray): Dominant eigenvectors corresponding to the sample correlation matrices.
+    - d (np.ndarray): Dominant eigenvalues corresponding to the sample correlation matrices.
     """
-    rows, cols, ncoils, _ = R.shape
-    N_iterations = 2
-    v = np.ones((rows, cols, ncoils))  # Initialize eigenvectors
+    rows, cols, ncoils, _ = r.shape
+    n_iterations = 2
+    v = np.ones((rows, cols, ncoils), dtype=complex)  # Initialize eigenvectors
 
     d = np.zeros((rows, cols))
-    for i in range(N_iterations):
-        # Calculate the matrix-vector product R*v along the last dimension
-        v = np.sum(R * np.tile(v[:, :, :, np.newaxis], (1, 1, 1, ncoils)), axis=2)
+    for i in range(n_iterations):
+        # Calculate the matrix-vector product r*v along the last dimension
+        v = np.sum(r * np.tile(v[:, :, :, np.newaxis], (1, 1, 1, ncoils)), axis=2)
 
         # Calculate the magnitude of the vector
         d = np.sqrt(np.sum(v * np.conj(v), axis=2))
@@ -675,15 +913,15 @@ def ismrm_eig_power(R):
     return v, d
 
 
-def ismrm_correlation_matrix(s):
+def ismrm_correlation_matrix(s: np.ndarray) -> np.ndarray:
     """
     Compute the sample correlation matrix for coil sensitivity maps.
 
     Args:
-    - s: 3D array representing coil sensitivity maps (rows x cols x ncoils).
+    - s (np.ndarray): 3D array representing coil sensitivity maps (rows x cols x ncoils).
 
     Returns:
-    - Rs: 4D array representing the sample correlation matrix (rows x cols x ncoils x ncoils).
+    - rs (np.ndarray): 4D array representing the sample correlation matrix (rows x cols x ncoils x ncoils).
     """
     rows, cols, ncoils = s.shape
     Rs = np.zeros((rows, cols, ncoils, ncoils), dtype=np.complex64)  # Initialize sample correlation matrix
@@ -697,7 +935,8 @@ def ismrm_correlation_matrix(s):
 
     return Rs
 
-def smooth(img, box=5):
+
+def smooth(img: np.ndarray, box: int = 5) -> np.ndarray:
     '''Smooths coil images
 
     :param img: Input complex images, ``[y, x] or [z, y, x]``
@@ -706,22 +945,19 @@ def smooth(img, box=5):
     :returns simg: Smoothed complex image ``[y,x] or [z,y,x]``
     '''
 
-    t_real = np.zeros(img.shape)
-    t_imag = np.zeros(img.shape)
+    t_real = np.zeros(img.shape, dtype=np.float64)
+    t_imag = np.zeros(img.shape, dtype=np.float64)
 
-    ndimage.filters.uniform_filter(img.real,size=box,output=t_real)
-    ndimage.filters.uniform_filter(img.imag,size=box,output=t_imag)
+    ndimage.filters.uniform_filter(img.real, size=box, output=t_real)
+    ndimage.filters.uniform_filter(img.imag, size=box, output=t_imag)
 
-    simg = t_real + 1j*t_imag
+    simg = t_real + 1j * t_imag
 
     return simg
 
 
-def ismrm_estimate_csm_walsh(img, smoothing=5):
+def ismrm_estimate_csm_walsh(img: np.ndarray, smoothing: int = 5) -> np.ndarray:
 
-    # Python conversion of the funtions from https://github.com/hansenms/ismrm_sunrise_matlab/blob/master/ismrm_estimate_csm_walsh.m
-    #Estimates relative coil sensitivity maps from a set of coil images using the eigenvector method described
-    # by Walsh et al. (Magn Reson Med2000;43:682-90.)
     """
     Estimate coil sensitivity maps using the Walsh method.
 
@@ -731,6 +967,11 @@ def ismrm_estimate_csm_walsh(img, smoothing=5):
 
     Returns:
     - csm: Coil sensitivity maps estimated using the Walsh method.
+
+    ----
+    Note: Python conversion of the funtions from https://github.com/hansenms/ismrm_sunrise_matlab/blob/master/ismrm_est
+    imate_csm_walsh.m Estimates relative coil sensitivity maps from a set of coil images using the eigenvector method
+    described by Walsh et al. (Magn Reson Med2000;43:682-90.)
     """
 
     ncoils = img.shape[2]
@@ -794,39 +1035,38 @@ def _calculate_sense_unmixing_1d(acc_factor, csm1d, regularization_factor):
     return unmix1d
 
 
-def calculate_sense_unmixing(acc_factor, csm, regularization_factor = 0.001):
+def calculate_sense_unmixing(acc_factor: float, csm: np.ndarray, regularization_factor: float = 0.001) -> Tuple[np.ndarray, np.ndarray]:
 
-    # SOURCE: https://github.com/ismrmrd/ismrmrd-python-tools/blob/master/ismrmrdtools/coils.py
-    '''Calculates the unmixing coefficients for a 2D image using a SENSE algorithm
+    '''
+    Calculates the unmixing coefficients for a 2D image using a SENSE algorithm
 
-    :param acc_factor: Acceleration factor, e.g. 2
-    :param csm: Coil sensitivity map, ``[coil, y, x]``
-    :param regularization_factor: adds tychonov regularization (default ``0.001``)
+    Args:
+    - acc_factor: Acceleration factor, e.g. 2
+    - csm: Coil sensitivity map, shape (coil, y, x)
+    - regularization_factor: adds tychonov regularization (default 0.001)
 
-        - 0 = no regularization
-        - set higher for more aggressive regularization.
-
-    :returns unmix: Image unmixing coefficients for a single ``x`` location, ``[coil, y, x]``
-    :returns gmap: Noise enhancement map, ``[y, x]``
+    Returns:
+    - unmix: Image unmixing coefficients for a single x location, shape (coil, y, x)
+    - gmap: Noise enhancement map, shape (y, x)
     '''
 
     assert csm.ndim == 3, "Coil sensitivity map must have exactly 3 dimensions"
 
-    unmix = np.zeros(csm.shape,np.complex64)
+    unmix = np.zeros(csm.shape, np.complex64)
 
-    for x in range(0,csm.shape[2]):
-        unmix[:,:,x] = _calculate_sense_unmixing_1d(acc_factor, np.squeeze(csm[:,:,x]), regularization_factor)
+    for x in range(0, csm.shape[2]):
+        unmix[:, :, x] = _calculate_sense_unmixing_1d(acc_factor, np.squeeze(csm[:, :, x]), regularization_factor)
 
     gmap = np.squeeze(np.sqrt(np.sum(abs(unmix) ** 2, 0))) * np.squeeze(np.sqrt(np.sum(abs(csm) ** 2, 0)))
 
-    return (unmix,gmap)
+    return unmix, gmap
 
 
-def sample_data_ET_mask(dset, etl, etc, leave_ET=0):
+def sample_data_ET_mask(dset: ismrmrd.Dataset, etl: int, etc: int, leave_ET: int = 0) -> np.ndarray:
 
-    #This functions samples the data into a numpy array with the option of subsampling it removing echo trains.
-    
     '''
+    This functions samples the data into a numpy array with the option of subsampling it removing echo trains.
+
     Arguments:
         - dset: data set in ismrmrd format
         - leave_ET: number of echo trains to remove from the end of the sampled data
@@ -835,6 +1075,7 @@ def sample_data_ET_mask(dset, etl, etc, leave_ET=0):
         - If "leave_ET" stays 0, only all_data is returned.
         - If not, the function returns all_data, subsampled_data removing full echo trains from the end.
     '''
+
     # Determine dimensions
     header = ismrmrd.xsd.CreateFromDocument(dset.read_xml_header())
     ncoils = header.acquisitionSystemInformation.receiverChannels
